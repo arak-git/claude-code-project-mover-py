@@ -178,10 +178,11 @@ class TestPatchClaudeJson(unittest.TestCase):
             cfg.write_text(json.dumps({
                 "projects": {old: {"allowedTools": []}}
             }), encoding='utf-8')
-            mcp.patch_claude_json(pathlib.Path(tmp), old, new)
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old, new)
             data = json.loads(cfg.read_text(encoding='utf-8'))
             self.assertIn(new, data['projects'])
             self.assertNotIn(old, data['projects'])
+            self.assertEqual(keys, 1)
 
     def test_T31_windows_backslash_key_converted(self):
         """~/.claude.json always uses forward slashes; backslash OLD_PATH must be converted"""
@@ -194,7 +195,7 @@ class TestPatchClaudeJson(unittest.TestCase):
             cfg.write_text(json.dumps({
                 "projects": {old_fwd: {"allowedTools": []}}
             }), encoding='utf-8')
-            mcp.patch_claude_json(pathlib.Path(tmp), old_win, new_win)
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old_win, new_win)
             data = json.loads(cfg.read_text(encoding='utf-8'))
             self.assertIn(new_fwd, data['projects'])
             self.assertNotIn(old_fwd, data['projects'])
@@ -205,16 +206,19 @@ class TestPatchClaudeJson(unittest.TestCase):
             cfg = pathlib.Path(tmp) / '.claude.json'
             orig = {"projects": {"other/path": {}}}
             cfg.write_text(json.dumps(orig), encoding='utf-8')
-            mcp.patch_claude_json(pathlib.Path(tmp), '/old/path', '/new/path')
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), '/old/path', '/new/path')
             data = json.loads(cfg.read_text(encoding='utf-8'))
             self.assertEqual(data, orig)  # unchanged
+            self.assertEqual(keys, 0)
 
     def test_T33_missing_projects_key_no_crash(self):
         """~/.claude.json without 'projects' key should not crash"""
         with tempfile.TemporaryDirectory() as tmp:
             cfg = pathlib.Path(tmp) / '.claude.json'
             cfg.write_text(json.dumps({"version": 1}), encoding='utf-8')
-            mcp.patch_claude_json(pathlib.Path(tmp), '/old', '/new')  # must not raise
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), '/old', '/new')
+            self.assertEqual(keys, 0)
+            self.assertEqual(envs, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,6 +340,213 @@ class TestVerifySessions(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(len(missing), 1)
             self.assertIn('/nonexistent/path/xyz', missing[0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T6x: B4/B5/B7 — sub-project keys, collision merge, MCP env vars
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPatchClaudeJsonAdvanced(unittest.TestCase):
+    """Tests for B4 (prefix key matching), B5 (MCP env vars), B7 (collision merge)."""
+
+    def _make_cfg(self, tmp, projects_dict):
+        cfg = pathlib.Path(tmp) / '.claude.json'
+        cfg.write_text(json.dumps({"projects": projects_dict}), encoding='utf-8')
+        return cfg
+
+    def _read(self, cfg):
+        return json.loads(pathlib.Path(cfg).read_text(encoding='utf-8'))
+
+    def test_T60_sub_project_key_renamed(self):
+        """B4: A sub-project key old/path/sub must be renamed to new/path/sub"""
+        old, new = '/Users/you/proj', '/Users/you/proj-new'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                '/Users/you/proj': {"allowedTools": []},
+                '/Users/you/proj/sub': {"allowedTools": ["bash"]},
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old, new)
+            data = self._read(cfg)
+            self.assertIn('/Users/you/proj-new', data['projects'])
+            self.assertIn('/Users/you/proj-new/sub', data['projects'])
+            self.assertNotIn('/Users/you/proj', data['projects'])
+            self.assertNotIn('/Users/you/proj/sub', data['projects'])
+            self.assertEqual(keys, 2)
+
+    def test_T61_backslash_variant_key_renamed(self):
+        r"""B4: A key using backslashes C:\old\path must also be renamed"""
+        old_win = r'C:\Users\Yoda\Documents\Claude-Code'
+        new_win = r'C:\Users\Yoda\claude-code-projects'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                'C:/Users/Yoda/Documents/Claude-Code': {"mcpServers": {"kb": {}}},
+                'C:\\Users\\Yoda\\Documents\\Claude-Code': {"allowedTools": []},
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old_win, new_win)
+            data = self._read(cfg)
+            # Both old keys should be gone
+            self.assertNotIn('C:/Users/Yoda/Documents/Claude-Code', data['projects'])
+            self.assertNotIn('C:\\Users\\Yoda\\Documents\\Claude-Code', data['projects'])
+            # New key should exist
+            self.assertIn('C:/Users/Yoda/claude-code-projects', data['projects'])
+            self.assertEqual(keys, 2)
+
+    def test_T62_collision_merge_keeps_richer_config(self):
+        """B7: When two keys normalize to same new key, the one with mcpServers survives"""
+        old_win = r'C:\Users\Yoda\Documents\proj'
+        new_win = r'C:\Users\Yoda\proj-new'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                # Key A: has MCP servers (richer)
+                'C:/Users/Yoda/Documents/proj': {
+                    "mcpServers": {"arun-kb": {"type": "stdio"}},
+                    "hasTrustDialogAccepted": True,
+                },
+                # Key B: backslash variant, no MCP servers (sparser)
+                'C:\\Users\\Yoda\\Documents\\proj': {
+                    "mcpServers": {},
+                    "hasTrustDialogAccepted": True,
+                },
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old_win, new_win)
+            data = self._read(cfg)
+            new_key = 'C:/Users/Yoda/proj-new'
+            self.assertIn(new_key, data['projects'])
+            # The richer config (with mcpServers) must survive
+            self.assertIn('arun-kb', data['projects'][new_key].get('mcpServers', {}))
+            # Trust must be merged (True from either)
+            self.assertTrue(data['projects'][new_key].get('hasTrustDialogAccepted'))
+
+    def test_T63_mcp_env_var_same_project_patched(self):
+        """B5: MCP env var value containing old_path is patched in the same project entry"""
+        old, new = '/Users/you/proj', '/Users/you/proj-new'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                '/Users/you/proj': {
+                    "mcpServers": {
+                        "kb": {
+                            "type": "stdio",
+                            "env": {"KB_ROOT": "/Users/you/proj/data"}
+                        }
+                    }
+                }
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old, new)
+            data = self._read(cfg)
+            env_val = data['projects']['/Users/you/proj-new']['mcpServers']['kb']['env']['KB_ROOT']
+            self.assertEqual(env_val, '/Users/you/proj-new/data')
+            self.assertGreater(envs, 0)
+
+    def test_T64_mcp_env_var_different_project_patched(self):
+        """B5: MCP env var in a DIFFERENT project key (F: backup scenario) is also patched"""
+        old, new = '/Users/you/proj', '/Users/you/proj-new'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                '/Users/you/proj': {"allowedTools": []},
+                'F:/backup/proj-copy': {
+                    "mcpServers": {
+                        "kb": {
+                            "type": "stdio",
+                            "env": {"KB_ROOT": "/Users/you/proj/data"}
+                        }
+                    }
+                }
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old, new)
+            data = self._read(cfg)
+            # F: key should NOT be renamed (different prefix)
+            self.assertIn('F:/backup/proj-copy', data['projects'])
+            # But its env var should be patched
+            env_val = data['projects']['F:/backup/proj-copy']['mcpServers']['kb']['env']['KB_ROOT']
+            self.assertEqual(env_val, '/Users/you/proj-new/data')
+            self.assertGreater(envs, 0)
+
+    def test_T65_return_value_is_key_count(self):
+        """B4: Return value first element is count of keys renamed"""
+        old, new = '/Users/you/proj', '/Users/you/proj-new'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                '/Users/you/proj': {},
+                '/Users/you/proj/sub1': {},
+                '/Users/you/proj/sub2': {},
+                '/unrelated/path': {},
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old, new)
+            self.assertEqual(keys, 3)  # main + 2 sub-projects
+            data = self._read(cfg)
+            self.assertIn('/unrelated/path', data['projects'])  # not renamed
+
+    def test_T66_backslash_env_var_patched(self):
+        r"""B5: Env var using backslash C:\old\path\sub is also patched"""
+        old_win = r'C:\Users\Yoda\Documents\Claude-Code'
+        new_win = r'C:\Users\Yoda\claude-code-projects'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._make_cfg(tmp, {
+                'F:/backup': {
+                    "mcpServers": {
+                        "kb": {
+                            "type": "stdio",
+                            "env": {
+                                "KB_ROOT": r"C:\Users\Yoda\Documents\Claude-Code\data"
+                            }
+                        }
+                    }
+                }
+            })
+            keys, envs = mcp.patch_claude_json(pathlib.Path(tmp), old_win, new_win)
+            data = self._read(cfg)
+            env_val = data['projects']['F:/backup']['mcpServers']['kb']['env']['KB_ROOT']
+            self.assertEqual(env_val, r'C:\Users\Yoda\claude-code-projects\data')
+            self.assertEqual(keys, 0)  # F:/backup doesn't match old path
+            self.assertGreater(envs, 0)
+
+
+class TestDryRun(unittest.TestCase):
+    """Verify --dry-run does not write to any files."""
+
+    OLD = '/Users/you/oldproj'
+    NEW = '/Users/you/newproj'
+
+    def test_T70_dry_run_metadata_no_write(self):
+        """Layer 1 dry run: file content must not change"""
+        with tempfile.TemporaryDirectory() as tmp:
+            f = pathlib.Path(tmp) / 'local_aaa.json'
+            original = json.dumps({"sessionId": "local_aaa", "cwd": self.OLD,
+                                   "originCwd": self.OLD, "title": "t", "model": "m"})
+            f.write_text(original, encoding='utf-8')
+            patched, _, _ = mcp.patch_metadata_files(
+                pathlib.Path(tmp), self.OLD, self.NEW, dry_run=True)
+            self.assertEqual(patched, 1)  # reports what WOULD change
+            self.assertEqual(f.read_text(encoding='utf-8'), original)  # file unchanged
+
+    def test_T71_dry_run_claude_json_no_write(self):
+        """Layer 2 dry run: .claude.json must not change"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / '.claude.json'
+            original = json.dumps({"projects": {self.OLD: {"allowedTools": []}}})
+            cfg.write_text(original, encoding='utf-8')
+            keys, envs = mcp.patch_claude_json(
+                pathlib.Path(tmp), self.OLD, self.NEW, dry_run=True)
+            self.assertEqual(keys, 1)
+            self.assertEqual(cfg.read_text(encoding='utf-8'), original)  # file unchanged
+
+    def test_T72_dry_run_project_folder_no_rename(self):
+        """Layer 3 dry run: folder must not be renamed, .jsonl must not change"""
+        with patch('move_claude_project.platform') as mock_plat:
+            mock_plat.system.return_value = 'Darwin'
+            with tempfile.TemporaryDirectory() as tmp:
+                projects_dir = pathlib.Path(tmp)
+                old_folder = projects_dir / '-Users-you-oldproj'
+                old_folder.mkdir()
+                f = old_folder / 'session.jsonl'
+                line = json.dumps({"cwd": self.OLD})
+                f.write_text(line, encoding='utf-8')
+                renamed, count = mcp.patch_project_folder(
+                    projects_dir, self.OLD, self.NEW, dry_run=True)
+                self.assertTrue(renamed)  # reports it WOULD rename
+                self.assertTrue(old_folder.exists())  # but folder unchanged
+                self.assertFalse((projects_dir / '-Users-you-newproj').exists())
+                self.assertEqual(f.read_text(encoding='utf-8'), line)  # content unchanged
 
 
 if __name__ == '__main__':

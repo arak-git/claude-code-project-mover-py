@@ -1,87 +1,54 @@
 # claude-code-project-mover-py
 
-**Cross-platform Python tool for moving a Claude Code project to a new folder.**
+Fixes the "Folder no longer exists" error after you move or rename a Claude Code project folder. Cross-platform (Windows, macOS, Linux), Python 3.8+, stdlib only.
 
-Fixes the *"Folder no longer exists. Please start a new session."* error that appears for all old sessions after you move or rename your Claude Code working directory.
+## The problem
 
-Works on **Windows, macOS, and Linux**. TDD-verified: 23/23 tests pass.
-
----
-
-## The Problem
-
-When you move a Claude Code working directory, the app shows:
+Move or rename your Claude Code working directory and every old session says:
 
 > Folder no longer exists. Please start a new session.
 
-for every old session. The error persists even after restarting Claude Code.
+Restarting doesn't fix it. The error persists because Claude Code stores paths in three separate places, and all three need updating.
 
-## Why Naive Fixes Don't Work
+| Layer | Where | What |
+|-------|-------|------|
+| 1 - Session metadata | `%APPDATA%\Claude\claude-code-sessions\` (Win), `~/Library/Application Support/Claude/` (macOS), `~/.config/Claude/` (Linux) | `local_*.json` files with `cwd` field. This is the actual source of the error. |
+| 2 - Project config | `~/.claude.json` | Project keys and MCP server env vars with absolute paths. |
+| 3 - Transcripts | `~/.claude/projects/<encoded>/` | `.jsonl` conversation history. |
 
-Claude Code stores session data in **three separate locations**. Most tools and guides only patch one or two of them. The error comes from the third.
-
-| Layer | Path | What it does |
-|-------|------|--------------|
-| **1 — UI metadata** ← *root cause* | `%APPDATA%\Claude\claude-code-sessions\...\local_*.json` (Win) `~/Library/Application Support/Claude/...` (macOS) `~/.config/Claude/...` (Linux) | Small JSON files the UI reads to render the session list. Contains `cwd` — the path that's checked for existence. |
-| **2 — Project config** | `~/.claude.json` | Per-project settings keyed by path. Stale keys cause config errors. |
-| **3 — Session transcripts** | `~/.claude/projects/<encoded>/` | Full conversation history (`.jsonl` files). Also needs patching for session resumption. |
-
-**This tool patches all three layers.**
-
----
-
-## Comparison with the Bash Alternative
-
-The shell script at [skydiver/claude-code-project-mover](https://github.com/skydiver/claude-code-project-mover) was the inspiration for this tool. It handles Layer 3 (folder rename + `.jsonl` patching) on macOS, but:
-
-| Gap | Impact |
-|-----|--------|
-| ❌ Never touches Layer 1 (`local_*.json`) | **"Folder no longer exists" error persists** after running it |
-| ❌ Never touches Layer 2 (`~/.claude.json`) | Project config failures |
-| ❌ `sed -i ''` is BSD sed (macOS only) | **Fails on Linux** with GNU sed |
-| ❌ Shallow `for file in $folder/*` glob | Misses `<uuid>/subagents/*.jsonl` |
-| ❌ Bash only | Doesn't run natively on Windows |
-
----
+Most other tools only patch Layer 3. The error comes from Layer 1. This tool patches all three.
 
 ## Usage
 
 ```bash
-# 1. Move your project folder first (Claude Code doesn't detect moves automatically)
-mv /old/path /new/path
+# Move your folder first, then run:
+python move_claude_project.py /old/path /new/path
 
-# 2. Edit OLD_PATH and NEW_PATH at the bottom of the script
-#    Then run:
-python move_claude_project.py
+# Preview what would change (no files touched):
+python move_claude_project.py /old/path /new/path --dry-run
 ```
 
-**Windows example** — edit the bottom of `move_claude_project.py`:
-```python
-OLD_PATH = r'C:\Users\You\Downloads\My Project'
-NEW_PATH = r'C:\Users\You\Documents\My Project'
+Windows paths need quotes:
+```bash
+python move_claude_project.py "C:\Users\You\Old Location" "C:\Users\You\New Location"
 ```
 
-**macOS/Linux example:**
-```python
-OLD_PATH = '/Users/you/old-location'
-NEW_PATH = '/Users/you/new-location'
+Restart Claude Code after running. Old sessions should load normally.
+
+For multiple moves, run the script once per path:
+```bash
+python move_claude_project.py /first/old /first/new
+python move_claude_project.py /second/old /second/new
 ```
 
-Then restart Claude Code. The sessions should load normally.
-
----
-
-## What It Does
+## Output
 
 ```
 === Layer 1: session metadata ===
-  PATCHED: local_0af09ce6-....json
-  PATCHED: local_1067d0f2-....json
-  ...
   Patched: 15, Skipped: 2, Errors: 0
 
 === Layer 2: ~/.claude.json ===
-  PATCHED: 'C:/Users/You/Old' -> 'C:/Users/You/New'
+  Keys renamed: 3, MCP env vars patched: 2
 
 === Layer 3: ~/.claude/projects ===
   Renaming: C--Users-You-Old -> C--Users-You-New
@@ -92,109 +59,35 @@ Then restart Claude Code. The sessions should load normally.
   RESTART Claude Code to apply changes.
 ```
 
----
+With `--dry-run`, you get the same report but nothing is written to disk.
 
-## Requirements
+## What it handles
 
-- Python 3.8+
-- No third-party dependencies (stdlib only)
+The basic case is obvious: old path becomes new path, done. Where it gets interesting is the stuff you wouldn't think to check until it breaks:
 
----
+- Claude Code encodes folder names by replacing all non-alphanumeric characters with dashes, so `Claude Code` becomes `Claude-Code`. Spaces trip up naive implementations.
+- On Unix, `/.config` encodes to `--config` (double dash), not `-.config`. Easy to get wrong.
+- `~/.claude.json` has keys for sub-projects too (`proj/submodule`), not just the root. An exact-match rename misses them.
+- MCP server env vars embed absolute paths (`KB_ROOT=/old/path/data`). These need patching even in project entries you didn't move.
+- Claude Code sometimes creates both `C:/path` and `C:\path` keys for the same project. When both rename to the same target, the second one would overwrite the first and you'd lose your MCP server config. The script detects this and merges instead.
+- A project at `/proj` shouldn't cause `/proj-backup` to get patched. Exact matching on `cwd`, substring matching on `planPath`.
+- Windows `.jsonl` files store paths with escaped backslashes (`\\\\` on disk). Handled transparently.
 
-## Running the Tests
+## Tests
 
 ```bash
 python test_move_claude_project.py -v
+# Ran 33 tests in 0.3s - OK
 ```
 
-```
-test_T01_basic_windows_path ... ok
-test_T02_space_in_path_becomes_dash ... ok
-...
-Ran 23 tests in 0.142s
-OK
-```
-
-The test suite covers all three layers, both platforms, edge cases including:
-- Spaces in Windows paths (`Claude Code` → `Claude-Code`)
-- Hidden directories on Unix (`/.config` → `--config`)
-- Prefix collision protection (exact `cwd` match, not substring)
-- Windows JSON double-backslash encoding
-- Recursive `subagents/` patching
-- Null `planPath` handling
-- Verification of all `cwd` paths post-migration
-
----
-
-## Bugs Fixed vs Simple Implementation
-
-Three non-obvious bugs exist in the naive implementation. All confirmed by `prove_bugs.py`:
-
-**B1 — Windows path encoding misses spaces**
-```python
-# Wrong: preserves space
-p.replace(':', '-').replace('\\', '-')  # 'Claude Code' stays 'Claude Code'
-
-# Fixed: all non-word chars become '-'
-re.sub(r'[^\w]', '-', p)               # 'Claude Code' -> 'Claude-Code'
-```
-Effect: folder rename silently fails for any path with a space.
-
-**B2 — Unix hidden directory encoding**
-```python
-# Wrong: '/.config' -> '-.config' (wrong folder name)
-p.replace('/', '-')
-
-# Fixed: '/.config' -> '--config'
-p.replace('/.', '--').replace('/', '-')
-```
-
-**B3 — Substring match causes prefix collision**
-```python
-# Wrong: patches '/proj-backup' when OLD='/proj'
-if old_path in cwd_value:
-
-# Fixed: exact match only
-if cwd_value == old_path:
-```
-
----
-
-## Multiple Path Changes
-
-If you also need to update other paths (e.g. a backup drive rename), extend the migration:
-
-```python
-if __name__ == '__main__':
-    substitutions = [
-        (r'C:\Users\You\Downloads\My Project', r'C:\Users\You\Documents\My Project'),
-        (r'F:\Backup\Old Name',                r'F:\Backup\New Name'),
-    ]
-    for old, new in substitutions:
-        run_migration(old, new)
-```
-
----
+The test suite covers all three layers on both platforms, including every edge case listed above plus dry-run verification.
 
 ## Notes
 
-- **Linux sessions path** follows XDG spec. Verify with:
-  `find ~/.config -name 'local_*.json' 2>/dev/null | head -5`
-- **Both old and new project folders exist**: this happens when you start using Claude Code from the new path before running this tool. The script detects this and warns — compare `.jsonl` record counts per UUID and keep the larger file.
-- **Restart required**: Layer 1 metadata is read at startup. A full app restart is needed after patching.
-
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `move_claude_project.py` | Main script (also importable as a module) |
-| `test_move_claude_project.py` | 23-test TDD suite |
-| `prove_bugs.py` | Demonstrates the 3 bugs in naive implementations |
-
----
+- On Linux, session paths follow the XDG spec. Check with: `find ~/.config -name 'local_*.json' 2>/dev/null | head -5`
+- If both old and new project folders already exist under `~/.claude/projects/`, the script warns you. Compare `.jsonl` file sizes per UUID and keep the larger one.
+- You must restart Claude Code after running. Layer 1 metadata is read at startup.
 
 ## Related
 
-- [skydiver/claude-code-project-mover](https://github.com/skydiver/claude-code-project-mover) — the original bash script (macOS, Layer 3 only)
+Inspired by [skydiver/claude-code-project-mover](https://github.com/skydiver/claude-code-project-mover) (bash, macOS, Layer 3 only).
