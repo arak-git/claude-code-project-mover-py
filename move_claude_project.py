@@ -9,7 +9,7 @@ Importable module: functions can be imported by test_move_claude_project.py
 """
 import sys, os, json, pathlib, platform, re
 
-__version__ = '2.0.0'
+__version__ = '2.3.0'
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -49,6 +49,19 @@ def encode_path(p):
     else:
         # macOS / Linux: /. (hidden dir separator) -> -- ; / -> -
         return p.replace('/.', '--').replace('/', '-')
+
+
+def _replace_path_variants(value, old_fwd, new_fwd, old_back, new_back):
+    """Replace old_path in a string value, handling both forward-slash and backslash variants.
+
+    Returns the updated string (unchanged if no match).
+    """
+    result = value
+    if old_fwd in result:
+        result = result.replace(old_fwd, new_fwd)
+    if old_back in result:
+        result = result.replace(old_back, new_back)
+    return result
 
 
 def patch_metadata_files(sessions_dir, old_path, new_path, dry_run=False):
@@ -111,11 +124,8 @@ def patch_mcp_env_vars(data, old_path, new_path):
             env = srv_cfg.get('env', {})
             for env_key, env_val in list(env.items()):
                 if isinstance(env_val, str):
-                    new_val = env_val
-                    if old_fwd in new_val:
-                        new_val = new_val.replace(old_fwd, new_fwd)
-                    if old_back in new_val:
-                        new_val = new_val.replace(old_back, new_back)
+                    new_val = _replace_path_variants(
+                        env_val, old_fwd, new_fwd, old_back, new_back)
                     if new_val != env_val:
                         env[env_key] = new_val
                         count += 1
@@ -187,6 +197,97 @@ def patch_claude_json(home, old_path, new_path, dry_run=False):
     return keys_count, env_count
 
 
+def patch_mcp_json_files(project_root, old_path, new_path, dry_run=False):
+    """
+    Layer 2.5: patch .mcp.json files in the (already-moved) project tree.
+
+    Finds all .mcp.json files under project_root via rglob.  For each file,
+    patches absolute paths in MCP server config fields: command, args, env values.
+
+    Handles two format variants:
+      - Canonical: {"mcpServers": {"name": {command, args, env}}}
+      - Flat:      {"name": {command, args, env}}  (no mcpServers wrapper)
+
+    Returns (files_patched, fields_patched, errors: list[(filename, msg)]).
+    """
+    project_root = pathlib.Path(project_root)
+    old_fwd = old_path.replace('\\', '/')
+    new_fwd = new_path.replace('\\', '/')
+    old_back = old_path.replace('/', '\\')
+    new_back = new_path.replace('/', '\\')
+
+    files_patched = 0
+    fields_patched = 0
+    errors = []
+
+    for mcp_file in sorted(project_root.rglob('.mcp.json')):
+        try:
+            text = mcp_file.read_text(encoding='utf-8')
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            errors.append((str(mcp_file), f'Malformed JSON: {e}'))
+            continue
+        except Exception as e:
+            errors.append((str(mcp_file), str(e)))
+            continue
+
+        if not isinstance(data, dict) or not data:
+            continue
+
+        # Detect format: canonical (has "mcpServers" key) vs flat
+        if 'mcpServers' in data and isinstance(data['mcpServers'], dict):
+            servers = data['mcpServers']
+        else:
+            # Flat format: each top-level key whose value is a dict is a server
+            servers = {k: v for k, v in data.items() if isinstance(v, dict)}
+
+        file_fields = 0
+        for srv_cfg in servers.values():
+            if not isinstance(srv_cfg, dict):
+                continue
+
+            # Patch "command" (string)
+            cmd = srv_cfg.get('command')
+            if isinstance(cmd, str):
+                new_cmd = _replace_path_variants(
+                    cmd, old_fwd, new_fwd, old_back, new_back)
+                if new_cmd != cmd:
+                    srv_cfg['command'] = new_cmd
+                    file_fields += 1
+
+            # Patch "args" (list of strings)
+            args = srv_cfg.get('args')
+            if isinstance(args, list):
+                for i, arg in enumerate(args):
+                    if isinstance(arg, str):
+                        new_arg = _replace_path_variants(
+                            arg, old_fwd, new_fwd, old_back, new_back)
+                        if new_arg != arg:
+                            args[i] = new_arg
+                            file_fields += 1
+
+            # Patch "env" (dict of string values)
+            env = srv_cfg.get('env')
+            if isinstance(env, dict):
+                for env_key, env_val in list(env.items()):
+                    if isinstance(env_val, str):
+                        new_val = _replace_path_variants(
+                            env_val, old_fwd, new_fwd, old_back, new_back)
+                        if new_val != env_val:
+                            env[env_key] = new_val
+                            file_fields += 1
+
+        if file_fields > 0:
+            if not dry_run:
+                mcp_file.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False),
+                    encoding='utf-8')
+            files_patched += 1
+            fields_patched += file_fields
+
+    return files_patched, fields_patched, errors
+
+
 def patch_project_folder(projects_dir, old_path, new_path, dry_run=False):
     """
     Layer 3: rename the ~/.claude/projects/<encoded> folder (if needed),
@@ -234,6 +335,257 @@ def patch_project_folder(projects_dir, old_path, new_path, dry_run=False):
     return renamed, count
 
 
+def patch_settings_local(project_root, old_path, new_path, dry_run=False):
+    """
+    Layer 4: patch .claude/settings.local.json in the project tree.
+
+    Permission allow-list entries embed absolute paths (e.g., Bash commands
+    referencing the project directory).  After a move, these become stale
+    cruft — they won't match anything and new permissions accumulate, but
+    patching them keeps the file clean.
+
+    Patches old_path occurrences inside string values in permissions.allow[].
+    Handles both forward-slash and backslash variants, plus JSON-escaped
+    backslashes (\\\\) which appear in Bash permission strings on Windows.
+
+    Returns (patched_count: int, total_entries: int).
+    """
+    project_root = pathlib.Path(project_root)
+    settings_file = project_root / '.claude' / 'settings.local.json'
+    if not settings_file.exists():
+        return 0, 0
+
+    try:
+        data = json.loads(settings_file.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, Exception):
+        return 0, 0
+
+    allow = data.get('permissions', {}).get('allow')
+    if not isinstance(allow, list):
+        return 0, 0
+
+    old_fwd = old_path.replace('\\', '/')
+    new_fwd = new_path.replace('\\', '/')
+    old_back = old_path.replace('/', '\\')
+    new_back = new_path.replace('/', '\\')
+    # JSON-escaped backslash variant (\\Users\\... on disk)
+    old_esc = old_path.replace('\\', '\\\\').replace('/', '\\\\')
+    new_esc = new_path.replace('\\', '\\\\').replace('/', '\\\\')
+
+    patched = 0
+    for i, entry in enumerate(allow):
+        if not isinstance(entry, str):
+            continue
+        new_entry = entry
+        if old_fwd in new_entry:
+            new_entry = new_entry.replace(old_fwd, new_fwd)
+        if old_back in new_entry:
+            new_entry = new_entry.replace(old_back, new_back)
+        if old_esc in new_entry:
+            new_entry = new_entry.replace(old_esc, new_esc)
+        if new_entry != entry:
+            allow[i] = new_entry
+            patched += 1
+
+    if patched > 0 and not dry_run:
+        settings_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    return patched, len(allow)
+
+
+def patch_memory_md(projects_dir, old_path, new_path, dry_run=False):
+    """
+    Layer 5: patch MEMORY.md and memory/*.md files under
+    ~/.claude/projects/<encoded>/memory/.
+
+    These files are read by future sessions for project context.  Stale
+    paths cause Claude to look in wrong locations.
+
+    Also patches plan files under ~/.claude/plans/ that reference old_path.
+
+    Returns (files_patched: int, total_scanned: int).
+    """
+    projects_dir = pathlib.Path(projects_dir)
+    new_encoded = encode_path(new_path)
+    memory_dir = projects_dir / new_encoded / 'memory'
+
+    old_fwd = old_path.replace('\\', '/')
+    new_fwd = new_path.replace('\\', '/')
+    old_back = old_path.replace('/', '\\')
+    new_back = new_path.replace('/', '\\')
+
+    files_patched = 0
+    total_scanned = 0
+
+    # Patch memory files
+    if memory_dir.exists():
+        for f in sorted(memory_dir.rglob('*.md')):
+            total_scanned += 1
+            try:
+                text = f.read_text(encoding='utf-8', errors='replace')
+                new_text = text
+                if old_fwd in new_text:
+                    new_text = new_text.replace(old_fwd, new_fwd)
+                if old_back in new_text:
+                    new_text = new_text.replace(old_back, new_back)
+                if new_text != text:
+                    if not dry_run:
+                        f.write_text(new_text, encoding='utf-8')
+                    files_patched += 1
+            except Exception:
+                pass
+
+    # Patch plan files that reference old_path
+    plans_dir = projects_dir.parent / 'plans'
+    if plans_dir.exists():
+        for f in sorted(plans_dir.glob('*.md')):
+            total_scanned += 1
+            try:
+                text = f.read_text(encoding='utf-8', errors='replace')
+                new_text = text
+                if old_fwd in new_text:
+                    new_text = new_text.replace(old_fwd, new_fwd)
+                if old_back in new_text:
+                    new_text = new_text.replace(old_back, new_back)
+                if new_text != text:
+                    if not dry_run:
+                        f.write_text(new_text, encoding='utf-8')
+                    files_patched += 1
+            except Exception:
+                pass
+
+    return files_patched, total_scanned
+
+
+def extract_paths_from_permission(entry):
+    """
+    Extract filesystem paths from a permission allow-list entry.
+
+    Recognizes these patterns:
+      - Quoted paths:  Bash(find "C:\\Users\\...\\data")
+      - Read paths:    Read(//c/Users/...) or Read(C:/Users/...)
+      - Parenthesized paths containing / or \\
+
+    Returns a list of candidate path strings (may be empty for
+    pattern-only entries like 'Bash(python:*)' or 'WebFetch(domain:...)').
+    """
+    paths = []
+
+    # 1. Quoted strings containing path separators
+    #    Matches both "C:\\Users\\..." and "/Users/..." inside quotes
+    for m in re.finditer(r'"([^"]*[/\\][^"]*)"', entry):
+        candidate = m.group(1)
+        # Unescape JSON-escaped backslashes for disk check
+        paths.append(candidate.replace('\\\\', '\\'))
+
+    # 2. Read(//path) or Read(/path) — no quotes
+    m = re.match(r'Read\((/[^)]+)\)', entry)
+    if m:
+        candidate = m.group(1)
+        # //c/Users/... → C:/Users/... for Windows disk check
+        # Format: //X/... where X is a single drive letter
+        if candidate.startswith('//') and len(candidate) > 3 and candidate[3] == '/':
+            candidate = candidate[2].upper() + ':' + candidate[3:]
+        paths.append(candidate)
+
+    # 3. Bash entries with unquoted absolute paths after known commands
+    #    e.g., Bash(CLAIM_REVIEW_ROOT="/path/..." ...) — already caught by #1
+    #    e.g., Bash(test -d "/path") — already caught by #1
+
+    return paths
+
+
+def prune_stale_permissions(project_root, dry_run=False, confirmed=False):
+    """
+    Layer 4 Phase B: remove permission entries whose embedded paths
+    no longer exist on disk.
+
+    Pattern-only entries (no extractable path) are never pruned.
+    Entries with paths that DO exist are never pruned.
+    Only entries with extractable paths confirmed dead are candidates.
+
+    Args:
+        project_root: path to the project directory
+        dry_run: if True, report but don't modify
+        confirmed: if True, skip interactive prompts (for tests).
+                   In CLI flow, run_migration handles the two-confirmation gate.
+
+    Returns:
+        (pruned_count: int, backup_path: str or None, stale_entries: list[str])
+        stale_entries is the list of entries identified as stale (returned even
+        if not confirmed, so caller can display them for the confirmation gate).
+    """
+    from datetime import datetime
+
+    project_root = pathlib.Path(project_root)
+    settings_file = project_root / '.claude' / 'settings.local.json'
+    if not settings_file.exists():
+        return 0, None, []
+
+    try:
+        data = json.loads(settings_file.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, Exception):
+        return 0, None, []
+
+    allow = data.get('permissions', {}).get('allow')
+    if not isinstance(allow, list):
+        return 0, None, []
+
+    # Identify stale entries
+    stale_entries = []
+    stale_indices = []
+    for i, entry in enumerate(allow):
+        if not isinstance(entry, str):
+            continue
+        paths = extract_paths_from_permission(entry)
+        if not paths:
+            # Pattern-only entry (no extractable path) — skip
+            continue
+        # Entry is stale if ALL extracted paths are dead
+        all_dead = all(not pathlib.Path(p).exists() for p in paths)
+        if all_dead:
+            stale_entries.append(entry)
+            stale_indices.append(i)
+
+    if not stale_entries:
+        return 0, None, []
+
+    if not confirmed:
+        # Return stale list for caller to display in confirmation gate
+        return 0, None, stale_entries
+
+    if dry_run:
+        return len(stale_entries), None, stale_entries
+
+    # Write backup file before modifying
+    now = datetime.now()
+    backup_name = f'settings_pruned_{now.strftime("%Y-%m-%d_%H%M%S")}.json'
+    backup_path = project_root / '.claude' / backup_name
+    backup_data = {
+        "pruned_at": now.isoformat(timespec='seconds'),
+        "source_file": ".claude/settings.local.json",
+        "reason": "Stale path pruning — extracted paths do not exist on disk",
+        "restore_instructions": (
+            "To restore: copy entries from the 'pruned_entries' array back into "
+            ".claude/settings.local.json → permissions.allow"
+        ),
+        "entry_count": len(stale_entries),
+        "pruned_entries": stale_entries,
+    }
+    backup_path.write_text(
+        json.dumps(backup_data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # Remove stale entries (reverse order to preserve indices)
+    for i in reversed(stale_indices):
+        allow.pop(i)
+
+    settings_file.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    return len(stale_entries), str(backup_path), stale_entries
+
+
 def verify_sessions(sessions_dir):
     """
     Check that all cwd paths in local_*.json files exist on disk.
@@ -256,7 +608,7 @@ def verify_sessions(sessions_dir):
 # Full migration runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_migration(old_path, new_path, dry_run=False):
+def run_migration(old_path, new_path, dry_run=False, prune_stale=False):
     home = pathlib.Path.home()
 
     if dry_run:
@@ -282,6 +634,20 @@ def run_migration(old_path, new_path, dry_run=False):
     else:
         print('  No matching key found (or file absent)')
 
+    print('\n=== Layer 2.5: .mcp.json in project tree ===')
+    new_root = pathlib.Path(new_path)
+    if new_root.exists():
+        files_p, fields_p, mcp_errs = patch_mcp_json_files(
+            new_root, old_path, new_path, dry_run=dry_run)
+        if files_p > 0 or mcp_errs:
+            print(f'  Files patched: {files_p}, Fields patched: {fields_p}, Errors: {len(mcp_errs)}')
+            for epath, emsg in mcp_errs:
+                print(f'  ERROR {epath}: {emsg}')
+        else:
+            print('  No .mcp.json files found (or none contained old paths)')
+    else:
+        print(f'  WARNING: new project root not found: {new_root}')
+
     print('\n=== Layer 3: ~/.claude/projects ===')
     projects_dir = home / '.claude' / 'projects'
     old_encoded = encode_path(old_path)
@@ -304,6 +670,67 @@ def run_migration(old_path, new_path, dry_run=False):
     renamed, jsonl_count = patch_project_folder(
         projects_dir, old_path, new_path, dry_run=dry_run)
     print(f'  Patched {jsonl_count} .jsonl files')
+
+    print('\n=== Layer 4: .claude/settings.local.json ===')
+    new_root = pathlib.Path(new_path)
+    if new_root.exists():
+        settings_patched, settings_total = patch_settings_local(
+            new_root, old_path, new_path, dry_run=dry_run)
+        if settings_patched > 0:
+            print(f'  Patched {settings_patched} of {settings_total} permission entries')
+        else:
+            print(f'  No stale paths in permissions ({settings_total} entries scanned)')
+    else:
+        print(f'  WARNING: project root not found: {new_root}')
+
+    print('\n=== Layer 5: MEMORY.md + plan files ===')
+    mem_patched, mem_total = patch_memory_md(
+        projects_dir, old_path, new_path, dry_run=dry_run)
+    if mem_patched > 0:
+        print(f'  Patched {mem_patched} of {mem_total} files')
+    else:
+        print(f'  No stale paths ({mem_total} files scanned)')
+
+    # Phase B: prune stale permissions (opt-in)
+    if prune_stale:
+        print('\n=== Layer 4B: prune stale permissions ===')
+        new_root = pathlib.Path(new_path)
+        if new_root.exists():
+            # First pass: identify stale entries (confirmed=False)
+            _, _, stale = prune_stale_permissions(new_root, dry_run=dry_run)
+            if not stale:
+                print('  No stale permission entries found.')
+            else:
+                print(f'\n  WARNING: Found {len(stale)} permission entries with dead paths.')
+                print('  These entries reference filesystem paths that no longer exist.')
+                print('  Pruning is REVERSIBLE — a backup file will be created.\n')
+                resp1 = input(f'  Show all {len(stale)} stale entries and proceed? (y/N): ').strip().lower()
+                if resp1 != 'y':
+                    print('  Pruning aborted.')
+                else:
+                    print()
+                    for i, entry in enumerate(stale, 1):
+                        # Truncate long entries for display
+                        display = entry if len(entry) <= 120 else entry[:117] + '...'
+                        print(f'  [{i:3d}] {display}')
+                    print()
+                    resp2 = input(
+                        f'  Confirm REMOVAL of these {len(stale)} entries from '
+                        f'settings.local.json? (y/N): '
+                    ).strip().lower()
+                    if resp2 != 'y':
+                        print('  Pruning aborted.')
+                    else:
+                        pruned, backup, _ = prune_stale_permissions(
+                            new_root, dry_run=dry_run, confirmed=True)
+                        if dry_run:
+                            print(f'  [DRY RUN] Would prune {pruned} entries.')
+                        else:
+                            print(f'  Pruned {pruned} entries.')
+                            print(f'  Backup saved: {backup}')
+                            print(f'  To restore: copy entries from backup → permissions.allow')
+        else:
+            print(f'  WARNING: project root not found: {new_root}')
 
     if dry_run:
         print('\n=== Dry run complete — no files were modified ===')
@@ -333,7 +760,11 @@ if __name__ == '__main__':
     parser.add_argument('new_path', help='New absolute path where the folder now lives')
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview changes without writing any files')
+    parser.add_argument('--prune-stale', action='store_true',
+                        help='After migration, interactively prune permission entries '
+                             'whose embedded paths no longer exist on disk')
     parser.add_argument('--version', action='version',
                         version=f'%(prog)s {__version__}')
     args = parser.parse_args()
-    run_migration(args.old_path, args.new_path, dry_run=args.dry_run)
+    run_migration(args.old_path, args.new_path,
+                  dry_run=args.dry_run, prune_stale=args.prune_stale)
